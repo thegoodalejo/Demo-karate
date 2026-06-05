@@ -14,8 +14,9 @@ Proyecto de automatización de pruebas de API REST construido con **Karate DSL**
 6. [KarateRunner.java — explicación detallada](#karaterunnerjava)
 7. [CucumberReport.java — explicación detallada](#cucumberreportjava)
 8. [.gitignore — explicación detallada](#gitignore)
-9. [Comandos de ejecución](#comandos-de-ejecución)
-10. [Sistema de tags](#sistema-de-tags)
+9. [Autenticación Microsoft Azure AD](#autenticación-microsoft-azure-ad)
+10. [Comandos de ejecución](#comandos-de-ejecución)
+11. [Sistema de tags](#sistema-de-tags)
 
 ---
 
@@ -137,6 +138,9 @@ mi-proyecto-karate/
 │           ├── karate-config.js        # Configuración global: URL base, endpoints, timeouts, SSL
 │           │
 │           ├── karate/                 # Features organizados por servicio
+│           │   ├── auth/               # Utilidades de autenticación (callables, no ejecutadas directamente)
+│           │   │   ├── microsoft-token.feature     # Obtiene el Bearer token de Azure AD (Client Credentials)
+│           │   │   └── demo-autenticacion.feature  # Demo de cómo el token se inyecta globalmente
 │           │   ├── activities/         # Escenarios positivos y negativos del servicio Activities
 │           │   ├── authors/            # Escenarios positivos y negativos del servicio Authors
 │           │   ├── books/              # Escenarios positivos y negativos del servicio Books
@@ -536,6 +540,194 @@ karate-reports/  # Reportes generados por ejecuciones locales de Karate
 
 ---
 
+## Autenticación Microsoft Azure AD
+
+Este proyecto implementa un sistema de autenticación flexible con **dos modos de operación** que cubren los entornos más comunes en proyectos empresariales:
+
+| Modo | Cuándo usarlo | Cómo activarlo |
+|---|---|---|
+| **Local (token manual)** | El developer tiene MFA activo y no puede usar Client Credentials directamente | `-Dauth.token=eyJhbGci...` |
+| **CI (Client Credentials)** | Pipeline de Azure Pipelines / GitHub Actions, sin MFA, usando Service Principal | `-Dauth.enabled=true -Dauth.tenantId=... -Dauth.clientId=... -Dauth.clientSecret=...` |
+| **Sin auth** | APIs públicas o que no requieren autenticación (comportamiento por defecto) | Ningún parámetro adicional |
+
+### ¿Por qué dos modos?
+
+En Azure AD corporativo, las cuentas de usuario suelen tener **MFA obligatorio**. El flujo **Client Credentials** (que autentica con `client_id` + `client_secret` en nombre de una aplicación, no de un usuario) **no está sujeto a MFA** porque la identidad es una Service Principal de aplicación, no un humano. Esto lo hace ideal para CI/CD.
+
+En local, el developer ya autenticó su sesión con MFA (en Postman, az cli, o el navegador) y simplemente copia el token resultante para pasárselo al test runner. No hace falta configurar ninguna Service Principal para trabajar localmente.
+
+### Cadena de prioridad en `karate-config.js`
+
+```
+¿Viene -Dauth.token=... ?
+    Sí  →  usar ese token directamente            (modo local — omite llamada a Azure AD)
+    No  →  ¿viene -Dauth.enabled=true ?
+               Sí  →  callSingle → microsoft-token.feature   (modo CI — Client Credentials)
+               No  →  sin autenticación
+```
+
+---
+
+### Archivo: `karate/auth/microsoft-token.feature`
+
+```gherkin
+@ignore
+Feature: Obtener token de acceso Microsoft Azure AD
+
+  Scenario: Solicitar token mediante Client Credentials Flow
+    Given url msLoginUrl + '/' + tenantId + '/oauth2/v2.0/token'
+    And header Content-Type = 'application/x-www-form-urlencoded'
+    And form fields
+      """
+      {
+        grant_type:    'client_credentials',
+        client_id:     '#(clientId)',
+        client_secret: '#(clientSecret)',
+        scope:         '#(scope)'
+      }
+      """
+    When method POST
+    Then status 200
+    * match response contains { access_token: '#string', token_type: '#string', expires_in: '#number' }
+    * def accessToken = response.access_token
+    * def tokenType   = response.token_type
+    * def expiresIn   = response.expires_in
+```
+
+**Por qué cada decisión de diseño:**
+
+| Elemento | Motivo |
+|---|---|
+| `@ignore` | Sin este tag, `KarateRunner` intentaría ejecutarlo directamente y fallaría porque las variables (`tenantId`, `clientId`, etc.) no existen en ese contexto — solo existen cuando se llama con `callSingle` pasándolas como argumento |
+| `form fields` | El endpoint de Azure AD (`/oauth2/v2.0/token`) exige el body en formato `application/x-www-form-urlencoded`, no JSON. Karate serializa automáticamente el mapa cuando se usa `form fields` en lugar de `request` |
+| `'#(clientId)'` en los form fields | Sintaxis de interpolación de Karate para variables en strings dentro de un bloque multilínea |
+| `match response contains` | Valida el response **antes** de extraer el token. Si las credenciales son inválidas, Azure AD devuelve `400` y el test falla aquí con mensaje claro, en vez de fallar después en cada escenario con un `401` críptico |
+| Variables `accessToken`, `tokenType`, `expiresIn` | Son las que `karate-config.js` lee del resultado de `callSingle` para construir el header `Authorization` |
+
+---
+
+### Cómo funciona `karate.callSingle()` (modo CI)
+
+`callSingle` es el mecanismo clave que hace eficiente la autenticación en el runner paralelo:
+
+```
+Runner paralelo con 3 threads
+  Thread 1 → Feature activities/... → necesita token
+  Thread 2 → Feature books/...      → necesita token    →  callSingle ejecuta
+  Thread 3 → Feature users/...      → necesita token       microsoft-token.feature
+                                                            UNA SOLA VEZ
+                                                            y cachea el resultado
+                                                            para los 3 threads
+```
+
+A diferencia de `karate.call()` (que ejecutaría el feature en cada invocación), **`callSingle` se ejecuta una única vez por corrida completa** y cachea el resultado en memoria JVM. Esto significa que aunque corran 50 escenarios en paralelo, solo se hace **una sola llamada** al endpoint de Azure AD. Sin esto, cada thread haría su propia petición de token, saturando el rate-limiting de Azure AD y multiplicando el tiempo de inicio de la suite.
+
+---
+
+### `karate.configure('headers', { Authorization: authToken })`
+
+Una vez obtenido el token (por cualquiera de los dos modos), esta línea lo inyecta como **header default global**:
+
+- No es necesario declarar `And header Authorization = authToken` en cada feature
+- Se aplica automáticamente a todos los requests HTTP del run
+- Es el equivalente a configurar un "Authorization header" a nivel de Collection en Postman
+- Si una API específica no requiere auth, simplemente ignora el header — no causa conflicto
+
+---
+
+### Cómo obtener el token en local (modo manual)
+
+**Opción 1 — Azure CLI** (recomendada):
+
+```bash
+# Login interactivo con MFA (solo la primera vez o cuando expira la sesión)
+az login
+
+# Obtener token para el scope de la API
+az account get-access-token --resource api://mi-api --query accessToken -o tsv
+
+# Pasar el resultado al test runner (copiar y pegar el token)
+./gradlew test -Dauth.token=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+**Opción 2 — Postman**:
+1. Configurar una petición con OAuth 2.0 en la pestaña Authorization
+2. Hacer click en "Get New Access Token" (esto dispara el MFA en el navegador)
+3. Copiar el `access_token` del resultado
+4. Pasarlo con `-Dauth.token=`
+
+**Opción 3 — DevTools del navegador**:
+1. Abrir la aplicación web que consume la misma API (ya autenticada con MFA)
+2. Abrir DevTools → Network → filtrar por requests a la API
+3. Copiar el valor del header `Authorization` de cualquier request, **sin el prefijo `Bearer `**
+4. Pasarlo con `-Dauth.token=`
+
+> Los tokens de Azure AD expiran en aproximadamente **1 hora**. Si la suite de tests dura más, habrá que renovar el token manualmente. El runner no intenta renovarlo automáticamente en modo local.
+
+---
+
+### Configuración en Azure Pipelines (modo CI)
+
+```yaml
+# azure-pipelines.yml
+
+variables:
+  - group: karate-auth-secrets   # Variable Group creado en Azure DevOps con las 4 variables secretas
+
+steps:
+  - task: Gradle@3
+    displayName: 'Ejecutar suite de tests de API'
+    inputs:
+      gradleWrapperFile: 'gradlew'
+      tasks: 'test'
+      options: >
+        -DbaseUrl=$(BASE_URL)
+        -Dauth.enabled=true
+        -Dauth.tenantId=$(AUTH_TENANT_ID)
+        -Dauth.clientId=$(AUTH_CLIENT_ID)
+        -Dauth.clientSecret=$(AUTH_CLIENT_SECRET)
+        -Dauth.scope=$(AUTH_SCOPE)
+```
+
+**Cómo configurar el Variable Group en Azure DevOps:**
+
+1. Ir a Pipelines → Library → + Variable Group
+2. Crear el grupo `karate-auth-secrets`
+3. Agregar las variables marcándolas como **secretas** (candado):
+
+| Variable | Descripción | Secreta |
+|---|---|---|
+| `AUTH_TENANT_ID` | ID del directorio de Azure AD (GUID) | No |
+| `AUTH_CLIENT_ID` | Application (client) ID del App Registration | No |
+| `AUTH_CLIENT_SECRET` | Client secret del App Registration | **Sí** |
+| `AUTH_SCOPE` | Scope de la API (ej: `api://mi-api/.default`) | No |
+| `BASE_URL` | URL base del ambiente que testea el pipeline | No |
+
+> `AUTH_CLIENT_SECRET` debe ser siempre secreta — Azure DevOps la enmascara en todos los logs del pipeline con `***`.
+
+---
+
+### Consideraciones de seguridad
+
+| Regla | Motivo |
+|---|---|
+| Nunca hardcodear credenciales en el código fuente | Un secret en git está comprometido permanentemente, aunque se borre después — queda en el historial |
+| Usar Variable Groups en Azure DevOps | Permite rotar el `client_secret` sin tocar el YAML del pipeline |
+| No loguear el token con `karate.log()` | Los logs de Gradle se guardan como artefactos en los pipelines — exponer el token ahí lo comprometería |
+| El `@ignore` en el feature de auth es obligatorio | Sin él, el runner lo ejecutaría directamente sin las variables de entrada y fallaría |
+| Tokens locales son de corta duración | Los tokens de Azure AD duran ~1 hora — no requieren revocación activa, simplemente vencen |
+
+---
+
+### Al clonar este proyecto
+
+Para apuntar la autenticación a un nuevo tenant o aplicación **no hay que modificar ningún archivo del proyecto**. Solo cambian las variables de ejecución:
+
+- El `scope` (`api://mi-api/.default`) se obtiene del App Registration del proyecto destino en Azure AD
+- El `tenantId`, `clientId` y `clientSecret` los provee el equipo de DevOps o IT que registró la Service Principal para los tests automatizados
+
+---
+
 ## Comandos de ejecución
 
 ### Ejecución completa
@@ -593,6 +785,40 @@ Karate carga automáticamente `karate-config-qa.js` si existe, permitiendo confi
 ./gradlew test \
   -DbaseUrl=https://staging.miapi.com \
   -Dkarate.env=qa \
+  -Dkarate.options="--tags @smoke"
+```
+
+### Con autenticación Microsoft Azure AD — modo local (token manual)
+
+```bash
+# Obtener el token con Azure CLI
+az account get-access-token --resource api://mi-api --query accessToken -o tsv
+
+# Ejecutar pasando el token (solo el valor, sin "Bearer ")
+./gradlew test -Dauth.token=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+### Con autenticación Microsoft Azure AD — modo CI (Client Credentials)
+
+```bash
+./gradlew test \
+  -Dauth.enabled=true \
+  -Dauth.tenantId=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  -Dauth.clientId=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy \
+  -Dauth.clientSecret=tu-client-secret \
+  -Dauth.scope=api://mi-api/.default
+```
+
+### Combinación completa: auth + baseUrl + tags
+
+```bash
+./gradlew test \
+  -DbaseUrl=https://staging.miapi.com \
+  -Dauth.enabled=true \
+  -Dauth.tenantId=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  -Dauth.clientId=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy \
+  -Dauth.clientSecret=tu-client-secret \
+  -Dauth.scope=api://mi-api/.default \
   -Dkarate.options="--tags @smoke"
 ```
 

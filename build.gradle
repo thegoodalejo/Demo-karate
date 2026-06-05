@@ -39,8 +39,18 @@ test {
     useJUnitPlatform()
     include '**/karate/**'
     systemProperty 'karate.options', System.properties.getProperty('karate.options')
-    systemProperty 'karate.env', System.properties.getProperty('karate.env')
-    systemProperty 'baseUrl', System.properties.getProperty('baseUrl', 'https://jsonplaceholder.typicode.com')
+    systemProperty 'karate.env',     System.properties.getProperty('karate.env')
+    systemProperty 'baseUrl',        System.properties.getProperty('baseUrl', 'https://fakerestapi.azurewebsites.net')
+
+    // Autenticación Microsoft Azure AD
+    // Local:  ./gradlew test -Dauth.token=eyJhbGci...
+    // CI:     ./gradlew test -Dauth.enabled=true -Dauth.tenantId=... -Dauth.clientId=... -Dauth.clientSecret=...
+    systemProperty 'auth.token',        System.properties.getProperty('auth.token',        '')
+    systemProperty 'auth.enabled',      System.properties.getProperty('auth.enabled',      'false')
+    systemProperty 'auth.tenantId',     System.properties.getProperty('auth.tenantId',     '')
+    systemProperty 'auth.clientId',     System.properties.getProperty('auth.clientId',     '')
+    systemProperty 'auth.clientSecret', System.properties.getProperty('auth.clientSecret', '')
+    systemProperty 'auth.scope',        System.properties.getProperty('auth.scope',        '')
     
     outputs.upToDateWhen { false }
     testLogging.showStandardStreams = true
