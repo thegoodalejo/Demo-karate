@@ -1,0 +1,8 @@
+{
+  "id":          1,
+  "title":       "Libro de prueba",
+  "description": "Descripción del libro de prueba",
+  "pageCount":   200,
+  "excerpt":     "Extracto del libro de prueba",
+  "publishDate": "2024-01-01T00:00:00.000Z"
+}

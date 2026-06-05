@@ -1,0 +1,5 @@
+{
+  "id":     "#number",
+  "idBook": "#number",
+  "url":    "#string?"
+}

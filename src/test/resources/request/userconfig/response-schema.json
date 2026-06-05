@@ -1,0 +1,8 @@
+{
+  "id":            "#number",
+  "userId":        "#number",
+  "theme":         "#string",
+  "language":      "#string",
+  "notifications": "#boolean",
+  "timezone":      "#string"
+}

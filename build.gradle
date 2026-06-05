@@ -6,25 +6,58 @@ plugins {
 group = 'com.tuempresa'
 version = '1.0-SNAPSHOT'
 
+ext {
+    karateCoreVersion    = '1.4.1'
+    karateApacheVersion  = '0.9.6'
+    cucumberVersion      = '5.7.5'
+    lombokVersion        = '1.18.34'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
+
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    testImplementation 'com.intuit.karate:karate-junit5:1.4.1'
+    testImplementation "com.intuit.karate:karate-core:${karateCoreVersion}"
+    testImplementation "com.intuit.karate:karate-apache:${karateApacheVersion}"
+    testImplementation "net.masterthought:cucumber-reporting:${cucumberVersion}"
+    testImplementation "org.json:json:20231013"
+    compileOnly         "org.projectlombok:lombok:${lombokVersion}"
+    annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
 }
 
 test {
     useJUnitPlatform()
+    include '**/karate/**'
     systemProperty 'karate.options', System.properties.getProperty('karate.options')
     systemProperty 'karate.env', System.properties.getProperty('karate.env')
+    systemProperty 'baseUrl', System.properties.getProperty('baseUrl', 'https://jsonplaceholder.typicode.com')
+    
     outputs.upToDateWhen { false }
+    testLogging.showStandardStreams = true
+    
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
 }
 
 sourceSets {
     test {
+        java {
+            srcDir file('src/test/java')
+        }
         resources {
-            srcDir 'src/test/java'
+            srcDir file('src/test/java')
+            exclude '**/*.java'
         }
     }
 }
